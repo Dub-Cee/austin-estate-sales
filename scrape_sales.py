@@ -6,6 +6,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 import re
 import os
+import pytz
 
 def scrape_estate_sales():
     """Scrape estate sales from EstateSales.NET for Austin, TX"""
@@ -29,15 +30,19 @@ def scrape_estate_sales():
         # Parse HTML with BeautifulSoup
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Extract sales information
-        sales = extract_sales_info(soup)
+        # Extract sales information with improved method
+        sales = extract_sales_info_improved(soup)
         print(f"Found {len(sales)} estate sales")
         
-        # Organize and format the results
-        organized_sales = organize_sales_by_weekend(sales)
+        # Debug: Print first few sales
+        for i, sale in enumerate(sales[:3]):
+            print(f"Sale {i+1}: {sale['title'][:50]}... | Dates: {sale['dates']}")
+        
+        # Organize and format the results with fixed weekend logic
+        organized_sales = organize_sales_by_weekend_fixed(sales)
         
         # Create email content
-        email_content = create_email_content(organized_sales)
+        email_content = create_email_content_improved(organized_sales)
         
         # Send email
         send_email(email_content)
@@ -48,34 +53,39 @@ def scrape_estate_sales():
         print(f"Error occurred: {str(e)}")
         send_error_email(str(e))
 
-def extract_sales_info(soup):
-    """Extract individual sale information from the parsed HTML"""
+def extract_sales_info_improved(soup):
+    """Extract individual sale information with better parsing"""
     sales = []
     
-    # Look for sale links - EstateSales.NET uses specific URL patterns
-    sale_links = soup.find_all('a', href=re.compile(r'/TX/Austin/\d+/\d+'))
+    # Method 1: Look for sale containers more broadly
+    sale_containers = soup.find_all(['div', 'article', 'section'], class_=re.compile(r'sale|listing|item'))
+    print(f"Found {len(sale_containers)} potential sale containers using class search")
     
+    # Method 2: Look for all links to sales
+    sale_links = soup.find_all('a', href=re.compile(r'/TX/Austin/\d+/\d+'))
     print(f"Found {len(sale_links)} sale links")
     
-    processed_urls = set()  # Avoid duplicates
+    # Method 3: Text-based extraction - look for sales in the HTML text
+    sales_from_text = extract_from_html_text(soup)
+    print(f"Found {len(sales_from_text)} sales from text extraction")
     
-    for link in sale_links:
+    # Combine all methods
+    processed_urls = set()
+    
+    # Process sale links (most reliable)
+    for link in sale_links[:30]:  # Increased limit
         try:
-            # Get the sale URL
             sale_url = link.get('href')
             if sale_url in processed_urls:
                 continue
             processed_urls.add(sale_url)
             
-            # Find the container that has the sale information
-            sale_container = link.find_parent(['div', 'article', 'section'])
-            if not sale_container:
-                sale_container = link
+            # Get surrounding content for this link
+            container = find_sale_container(link)
             
-            # Extract sale information
-            title = extract_sale_title(sale_container, link)
-            address = extract_sale_address(sale_container)
-            dates = extract_sale_dates(sale_container)
+            title = extract_sale_title_improved(container, link)
+            address = extract_sale_address_improved(container)
+            dates = extract_sale_dates_improved(container)
             
             sale = {
                 'title': title,
@@ -86,117 +96,188 @@ def extract_sales_info(soup):
             
             sales.append(sale)
             
-            # Limit to prevent too many results
-            if len(sales) >= 25:
-                break
-                
         except Exception as e:
             print(f"Error processing sale link: {str(e)}")
             continue
     
-    return sales
-
-def extract_sale_title(container, link):
-    """Extract the title of the estate sale"""
-    # Try different methods to find the title
+    # Add sales from text extraction if we don't have many
+    if len(sales) < 10:
+        sales.extend(sales_from_text[:10])
     
-    # Method 1: Look for heading tags
+    return sales[:25]  # Return up to 25 sales
+
+def find_sale_container(link):
+    """Find the container that holds the sale information"""
+    # Try to find the parent container that has the sale info
+    container = link
+    
+    # Go up the DOM tree to find a good container
+    for i in range(5):  # Try up to 5 levels up
+        if container.parent:
+            container = container.parent
+            # Stop if we find a container with good content
+            text_content = container.get_text()
+            if len(text_content) > 100 and ('Austin' in text_content or 'TX' in text_content):
+                break
+    
+    return container
+
+def extract_sale_title_improved(container, link):
+    """Extract title with multiple strategies"""
+    # Strategy 1: Heading tags
     for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
         heading = container.find(tag)
         if heading and heading.get_text(strip=True):
             title = heading.get_text(strip=True)
-            if len(title) > 5 and len(title) < 150:
-                return title
+            if 5 < len(title) < 150 and not title.lower().startswith('http'):
+                return clean_text(title)
     
-    # Method 2: Look for title attribute
+    # Strategy 2: Title attribute
     if link.get('title'):
         title = link.get('title').strip()
         if len(title) > 5:
-            return title
+            return clean_text(title)
     
-    # Method 3: Look for text content with good length
-    text_content = container.get_text(strip=True)
+    # Strategy 3: Strong/bold text
+    strong_tags = container.find_all(['strong', 'b'])
+    for tag in strong_tags:
+        text = tag.get_text(strip=True)
+        if 10 < len(text) < 100:
+            return clean_text(text)
+    
+    # Strategy 4: Look for descriptive text
+    text_content = container.get_text()
     lines = [line.strip() for line in text_content.split('\n') if line.strip()]
     
     for line in lines:
-        if 10 < len(line) < 100 and not line.startswith('http') and 'TX' not in line:
-            return line
+        # Skip lines that are clearly not titles
+        if (10 < len(line) < 100 and 
+            not line.startswith('http') and 
+            not re.match(r'^\d+$', line) and
+            not line.lower().startswith('austin, tx')):
+            return clean_text(line)
     
     return "Estate Sale"
 
-def extract_sale_address(container):
-    """Extract the address of the estate sale"""
+def extract_sale_address_improved(container):
+    """Extract address with better patterns"""
     text = container.get_text()
     
-    # Look for Texas address patterns
-    address_patterns = [
-        r'\d+[^,\n]*,\s*[A-Za-z\s]+,\s*TX\s*\d*',
-        r'Austin,\s*TX\s*\d*',
+    # Address patterns for Austin area
+    patterns = [
+        r'\d+[^,\n]*(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|way|blvd|boulevard|circle|cir|court|ct|place|pl)[^,\n]*,\s*[A-Za-z\s]+,\s*TX\s*\d*',
+        r'\d+[^,\n]*,\s*Austin,\s*TX\s*\d*',
+        r'\d+[^,\n]*,\s*[A-Za-z\s]+,\s*TX\s*\d{5}',
+        r'Austin,\s*TX\s*\d{5}',
         r'TX\s*\d{5}'
     ]
     
-    for pattern in address_patterns:
+    for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             address = match.group().strip()
-            if len(address) > 5:
-                return address
+            if len(address) > 8:
+                return clean_text(address)
     
     return "Austin, TX (see website for full address)"
 
-def extract_sale_dates(container):
-    """Extract the dates of the estate sale"""
+def extract_sale_dates_improved(container):
+    """Extract dates with comprehensive patterns"""
     text = container.get_text()
     
-    # Look for date patterns
-    date_patterns = [
-        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:\s*,\s*\d{4})?',
-        r'\d{1,2}/\d{1,2}(?:/\d{2,4})?',
-        r'(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)'
+    # Multiple date patterns
+    patterns = [
+        # "Aug 14, 15, 16" or "August 14-16"
+        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(?:\s*[-,]\s*\d{1,2})*(?:\s*[-,]\s*\d{1,2})*',
+        # "8/14, 8/15, 8/16" or "8/14-8/16"
+        r'\d{1,2}/\d{1,2}(?:\s*[-,]\s*\d{1,2}/\d{1,2})*',
+        # Day names
+        r'(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)(?:\s*[-,]\s*(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))*',
+        # "14th, 15th, 16th"
+        r'\d{1,2}(?:st|nd|rd|th)(?:\s*[-,]\s*\d{1,2}(?:st|nd|rd|th))*'
     ]
     
     found_dates = []
     
-    for pattern in date_patterns:
+    for pattern in patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         for match in matches:
             if isinstance(match, tuple):
-                match = ' '.join(match)
-            if match not in found_dates:
-                found_dates.append(match)
+                # Handle tuple results from groups
+                date_str = ' '.join([m for m in match if m])
+            else:
+                date_str = match
+            
+            if date_str and date_str not in found_dates:
+                found_dates.append(date_str)
     
     if found_dates:
-        return ', '.join(found_dates[:4])  # Limit to first 4 dates
+        # Return the first few unique dates
+        return ', '.join(found_dates[:5])
     
     return "See website for dates"
 
-def organize_sales_by_weekend(sales):
-    """Organize sales into weekend buckets"""
-    today = datetime.now()
+def extract_from_html_text(soup):
+    """Extract sales by parsing HTML text patterns"""
+    sales = []
     
-    # Calculate this weekend and next weekend date ranges
-    days_until_thursday = (3 - today.weekday()) % 7  # Thursday is 3
-    if days_until_thursday == 0 and today.weekday() > 3:
-        days_until_thursday = 7
+    # Get all text and look for sale patterns
+    text = soup.get_text()
     
-    this_weekend_start = today + timedelta(days=days_until_thursday)
-    next_weekend_start = this_weekend_start + timedelta(days=7)
+    # Look for URLs in the text
+    url_pattern = r'/TX/Austin/(\d+)/(\d+)'
+    url_matches = re.findall(url_pattern, text)
     
-    this_weekend_days = set()
-    next_weekend_days = set()
+    for match in url_matches[:10]:
+        sale_id = match[1]
+        sale_url = f"/TX/Austin/{match[0]}/{match[1]}"
+        
+        sales.append({
+            'title': f"Estate Sale #{sale_id}",
+            'address': "Austin, TX (see website)",
+            'dates': "Check website for dates",
+            'link': f"https://www.estatesales.net{sale_url}"
+        })
+    
+    return sales
+
+def organize_sales_by_weekend_fixed(sales):
+    """Fixed weekend organization with proper timezone handling"""
+    # Use Central Time Zone
+    central_tz = pytz.timezone('US/Central')
+    utc_now = datetime.utcnow()
+    central_now = utc_now.replace(tzinfo=pytz.UTC).astimezone(central_tz)
+    
+    print(f"Current Central Time: {central_now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"Current day of week: {central_now.strftime('%A')} (weekday: {central_now.weekday()})")
+    
+    # Calculate this weekend (Thursday-Sunday)
+    current_weekday = central_now.weekday()  # Monday=0, Sunday=6
+    
+    # Days until Thursday (weekday 3)
+    if current_weekday <= 3:  # Monday through Thursday
+        days_to_thursday = 3 - current_weekday
+    else:  # Friday, Saturday, Sunday
+        days_to_thursday = 7 - current_weekday + 3  # Next Thursday
+    
+    this_thursday = central_now + timedelta(days=days_to_thursday)
+    next_thursday = this_thursday + timedelta(days=7)
     
     # This weekend: Thursday through Sunday
+    this_weekend_days = []
     for i in range(4):  # Thu, Fri, Sat, Sun
-        day = this_weekend_start + timedelta(days=i)
-        this_weekend_days.add(day.day)
+        day = this_thursday + timedelta(days=i)
+        this_weekend_days.append(day.day)
     
-    # Next weekend: Thursday through Sunday
+    # Next weekend: Thursday through Sunday  
+    next_weekend_days = []
     for i in range(4):
-        day = next_weekend_start + timedelta(days=i)
-        next_weekend_days.add(day.day)
+        day = next_thursday + timedelta(days=i)
+        next_weekend_days.append(day.day)
     
-    print(f"This weekend target days: {sorted(this_weekend_days)}")
-    print(f"Next weekend target days: {sorted(next_weekend_days)}")
+    print(f"This weekend dates: {this_thursday.strftime('%A %b %d')} - {(this_thursday + timedelta(days=3)).strftime('%A %b %d')}")
+    print(f"This weekend target days: {this_weekend_days}")
+    print(f"Next weekend target days: {next_weekend_days}")
     
     this_weekend = []
     next_weekend = []
@@ -204,9 +285,11 @@ def organize_sales_by_weekend(sales):
     
     for sale in sales:
         dates_text = sale['dates'].lower()
+        print(f"Processing sale: {sale['title'][:30]}... | Dates: {dates_text}")
         
         # Extract day numbers from the date string
         day_numbers = [int(x) for x in re.findall(r'\b(\d{1,2})\b', dates_text) if 1 <= int(x) <= 31]
+        print(f"  Found day numbers: {day_numbers}")
         
         # Check if any day matches our weekend periods
         is_this_weekend = any(day in this_weekend_days for day in day_numbers)
@@ -214,10 +297,15 @@ def organize_sales_by_weekend(sales):
         
         if is_this_weekend and not is_next_weekend:
             this_weekend.append(sale)
+            print(f"  -> Assigned to THIS WEEKEND")
         elif is_next_weekend and not is_this_weekend:
             next_weekend.append(sale)
+            print(f"  -> Assigned to NEXT WEEKEND")
         else:
             other_sales.append(sale)
+            print(f"  -> Assigned to OTHER")
+    
+    print(f"Final counts: This weekend: {len(this_weekend)}, Next weekend: {len(next_weekend)}, Other: {len(other_sales)}")
     
     return {
         'this_weekend': this_weekend,
@@ -225,11 +313,14 @@ def organize_sales_by_weekend(sales):
         'other': other_sales
     }
 
-def create_email_content(organized_sales):
-    """Create the formatted email content"""
+def create_email_content_improved(organized_sales):
+    """Create email with better formatting and Central Time"""
+    central_tz = pytz.timezone('US/Central')
+    central_now = datetime.utcnow().replace(tzinfo=pytz.UTC).astimezone(central_tz)
+    
     content = "AUSTIN ESTATE SALES - WEEKLY UPDATE\n"
     content += "===================================\n"
-    content += f"Generated: {datetime.now().strftime('%B %d, %Y')}\n\n"
+    content += f"Generated: {central_now.strftime('%B %d, %Y at %I:%M %p Central')}\n\n"
     
     # This Weekend Section
     content += "THIS WEEKEND (Thursday - Sunday)\n"
@@ -262,20 +353,27 @@ def create_email_content(organized_sales):
         content += "OTHER UPCOMING SALES\n"
         content += "--------------------\n\n"
         
-        for i, sale in enumerate(organized_sales['other'][:10], 1):  # Limit to 10
+        for i, sale in enumerate(organized_sales['other'][:15], 1):
             content += f"{i}. {sale['title']}\n"
             content += f"   Address: {sale['address']}\n"
             content += f"   Dates: {sale['dates']}\n"
             content += f"   Link: {sale['link']}\n\n"
     
-    content += "\nHappy treasure hunting!\n"
-    content += "- Austin Estate Sales Tracker"
+    content += f"\nHappy treasure hunting!\n"
+    content += f"- Austin Estate Sales Tracker (Last updated: {central_now.strftime('%m/%d/%Y %I:%M %p CT')})"
     
     return content
 
+def clean_text(text):
+    """Clean and normalize text"""
+    # Remove extra whitespace and clean up
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Remove HTML entities
+    text = text.replace('&amp;', '&').replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>')
+    return text
+
 def send_email(content):
     """Send the email using Gmail SMTP"""
-    # Get email credentials from environment variables
     sender_email = os.environ.get('GMAIL_USER')
     sender_password = os.environ.get('GMAIL_APP_PASSWORD')
     recipient_email = os.environ.get('RECIPIENT_EMAIL')
@@ -285,21 +383,21 @@ def send_email(content):
         return
     
     try:
-        # Create message
+        # Use Central Time for email subject
+        central_tz = pytz.timezone('US/Central')
+        central_now = datetime.utcnow().replace(tzinfo=pytz.UTC).astimezone(central_tz)
+        
         msg = MIMEMultipart()
         msg['From'] = sender_email
         msg['To'] = recipient_email
-        msg['Subject'] = f"Austin Estate Sales - {datetime.now().strftime('%B %d, %Y')}"
+        msg['Subject'] = f"Austin Estate Sales - {central_now.strftime('%B %d, %Y')}"
         
-        # Add body to email
         msg.attach(MIMEText(content, 'plain'))
         
-        # Gmail SMTP configuration
         server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()  # Enable security
+        server.starttls()
         server.login(sender_email, sender_password)
         
-        # Send email
         text = msg.as_string()
         server.sendmail(sender_email, recipient_email, text)
         server.quit()
